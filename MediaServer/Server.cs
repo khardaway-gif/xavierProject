@@ -3,7 +3,45 @@ using System.Net;
 using System.Text;
 using Microsoft.Extensions.Logging;
 using System.Reflection.PortableExecutable;
+using System.Collections.Concurrent;
 
+class SocketAsyncEventArgsPool
+{
+    private readonly ConcurrentBag<SocketAsyncEventArgs> pool;
+
+    public SocketAsyncEventArgsPool(int initialCapacity)
+    {
+        pool = new ConcurrentBag<SocketAsyncEventArgs>();
+
+        // Prepopulate the pool with instances
+        for (int i = 0; i < initialCapacity; i++)
+        {
+            var args = new SocketAsyncEventArgs();
+            args.Completed += (sender, e) => { /* Handle completion */ };
+            pool.Add(args);
+        }
+    }
+
+    public SocketAsyncEventArgs Rent()
+    {
+        if (pool.TryTake(out var args))
+        {
+            return args;
+        }
+
+        // Create a new instance if the pool is empty
+        var newArgs = new SocketAsyncEventArgs();
+        newArgs.Completed += (sender, e) => { /* Handle completion */ };
+        return newArgs;
+    }
+
+    public void Return(SocketAsyncEventArgs args)
+    {
+        // Reset the instance before returning it to the pool
+        args.AcceptSocket = null;
+        pool.Add(args);
+    }
+}
 
 namespace MediaServer
 {
@@ -20,12 +58,14 @@ namespace MediaServer
         private AvailableMedia availableMedia;
         private Semaphore maxNumberAcceptedClients;
         private IPEndPoint IPE;
+        private SocketAsyncEventArgsPool eventArgsPool;
 
         private Server()
         {
             socServer = null;
             connections = 0;
             maxNumberAcceptedClients = new Semaphore(MAXCONNECTIONS, MAXCONNECTIONS);
+            eventArgsPool = new SocketAsyncEventArgsPool(MAXCONNECTIONS);
         }
         public Server(string ip, int port, string mediaDir) : this()
         {
@@ -69,15 +109,13 @@ namespace MediaServer
         /// </summary>
         private void Listen()
         {
-            SocketAsyncEventArgs e = new SocketAsyncEventArgs();
-            e.Completed += AcceptCallback;
-
             while (this.running)
             {
                 Console.WriteLine("Waiting for a connection...");
                 maxNumberAcceptedClients.WaitOne();
 
-                e.AcceptSocket = null; // Reset the AcceptSocket to ensure it's ready for a new connection
+                // Rent a SocketAsyncEventArgs instance from the pool
+                var e = eventArgsPool.Rent();
 
                 // Start an asynchronous accept operation
                 if (!socServer.AcceptAsync(e))
